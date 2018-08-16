@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+var nilErrorValue = reflect.Zero(reflect.TypeOf((*error)(nil)).Elem())
+
 // ----------------------------------------------------------------------------
 // Codec
 // ----------------------------------------------------------------------------
@@ -61,6 +63,7 @@ type Server struct {
 	interceptFunc func(i *RequestInfo) *http.Request
 	beforeFunc    func(i *RequestInfo)
 	afterFunc     func(i *RequestInfo)
+	validateFunc  reflect.Value
 }
 
 // RegisterCodec adds a new codec to the server.
@@ -89,6 +92,15 @@ func (s *Server) RegisterInterceptFunc(f func(i *RequestInfo) *http.Request) {
 // method will overwrite all the previous functions.
 func (s *Server) RegisterBeforeFunc(f func(i *RequestInfo)) {
 	s.beforeFunc = f
+}
+
+// RegisterValidateRequestFunc registers the specified function as the function
+// that will be called after the BeforeFunc (if registered) and before invoking
+// the actual Service method. If this function returns a non-nil error, the method
+// won't be invoked and this error will be considered as the method result.
+// The argument of this function is the already-unmarshalled *args parameter of the method.
+func (s *Server) RegisterValidateRequestFunc(f func(i interface{}) error) {
+	s.validateFunc = reflect.ValueOf(f)
 }
 
 // RegisterAfterFunc registers the specified function as the function
@@ -190,20 +202,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Call the service method.
+	// Prepare the reply, we need it even if validation fails
 	reply := reflect.New(methodSpec.replyType)
-	errValue := methodSpec.method.Func.Call([]reflect.Value{
-		serviceSpec.rcvr,
-		reflect.ValueOf(r),
-		args,
-		reply,
-	})
-	// Cast the result to error if needed.
-	var errResult error
-	errInter := errValue[0].Interface()
-	if errInter != nil {
-		errResult = errInter.(error)
+	errValue := []reflect.Value{nilErrorValue}
+
+	// Call the registered Validator Function
+	if s.validateFunc.IsValid() {
+		errValue = s.validateFunc.Call([]reflect.Value{args})
 	}
+
+	// If still no errors after validation, call the method
+	if errValue[0].IsNil() {
+		errValue = methodSpec.method.Func.Call([]reflect.Value{
+			serviceSpec.rcvr,
+			reflect.ValueOf(r),
+			args,
+			reply,
+		})
+	}
+
+	// Extract the result to error if needed.
+	var errResult error
+	if !errValue[0].IsNil() {
+		errResult = errValue[0].Interface().(error)
+	}
+
 	// Prevents Internet Explorer from MIME-sniffing a response away
 	// from the declared content-type
 	w.Header().Set("x-content-type-options", "nosniff")
